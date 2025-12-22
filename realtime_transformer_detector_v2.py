@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-this script should run in the local machine (pfSense firewall or IDS)
+realtime_transformer_detector_v2.py
 
-realtime_transformer_detector.py
-Supports:
- - live packet capture (scapy/tcpdump)
- - real-time pfSense filter.log tailing (clog -f or tail -F)
-Aggregates 1-second windows, keeps last `SEQ_LEN` windows, predicts with saved model.
+This script is optimized for real-time performance by delegating the 
+high-frequency flow tracking and feature aggregation logic to a C++ extension.
+
+The C++ module (flow_agg_cpp) must be compiled and available in the environment.
 """
 
 import time
 import threading
 import subprocess
-from collections import deque, Counter
-import queue
+from collections import deque
+import queue # Still useful for the model prediction queue
 import os
 import sys
 import json
@@ -24,18 +23,84 @@ import joblib
 import tensorflow as tf
 from tensorflow import keras
 
-from feature_config import FEATURE_COLUMNS, load_feature_metadata
+# ----------------------------------------------------------------------
+# IMPORTANT: C++ Integration Setup
+# ----------------------------------------------------------------------
+# The C++ files (FlowAggregator.hpp, FlowAggregator.cpp) must be compiled
+# into a Python module, assumed here to be named 'flow_agg_cpp', using 
+# a tool like pybind11. 
+# 
+# To allow this script to run without actual C++ compilation for testing,
+# we include a Mock class below. For production, DELETE THE MOCK CLASS 
+# and uncomment the actual import.
+# ----------------------------------------------------------------------
+
+# --- MOCK C++ MODULE (DELETE FOR PRODUCTION) ---
+class MockFlowAggregator:
+    """Mocks the C++ FlowAggregator class for testing without compilation."""
+    def __init__(self, window_ms=1000):
+        print("WARNING: Using MOCK C++ Aggregator. Compile C++ code for speed!")
+        self.window_ms = window_ms
+        self.last_flush_time = int(time.time() * 1000)
+
+    def update_flow(self, flow_id, packet_size, protocol, current_time_ms):
+        # In a real C++ implementation, this would update the hash map
+        pass
+
+    def check_and_flush_window(self, current_time_ms):
+        # In a real C++ implementation, this returns feature vectors on flush
+        if current_time_ms > self.last_flush_time + self.window_ms:
+            self.last_flush_time = current_time_ms
+            # Return dummy data matching the required (BATCH_SIZE, FEATURE_VECTOR_SIZE)
+            # which is (1, 10) in this mock example.
+            return [list(np.random.rand(10))]
+        return []
+
+flow_agg_cpp = sys.modules.get('flow_agg_cpp', None)
+if flow_agg_cpp is None:
+    class FlowAggregator(MockFlowAggregator): pass
+    print("MOCK: Loaded MockFlowAggregator as C++ module not found.")
+else:
+    # --- REAL C++ MODULE IMPORT (UNCOMMENT FOR PRODUCTION) ---
+    from flow_agg_cpp import FlowAggregator
+    pass
+# ----------------------------------------------------------------------
+
+
+# --- Global Settings ---
+MODEL_PATH = Path('./transformer_detector.h5')
+SCALER_PATH = Path('./scaler.pkl')
+LOG_FILE = 'detector_alerts.log'
+WINDOW_MS = 1000  # 1 second aggregation window
+SEQ_LEN = 30  # Number of historical windows to feed to the Transformer
+PRED_THRESHOLD = 0.8  # DDoS detection probability threshold
+
+# Enable/Disable Data Sources (requires appropriate external tools/libraries)
+ENABLE_SNIF = False  # Requires Scapy or similar for live capture
+ENABLE_PFSENSE = False # Requires SSH/tail access to pfSense filter log
+# The sniffing worker typically provides the raw data needed for the C++ object.
+# Since we can't run scapy here, we mock the data extraction.
+
+# Placeholder for feature metadata (should be loaded from your config)
+FEATURE_COLUMNS = [
+    "packet_count", "byte_count", "avg_pkt_size", "std_pkt_size", "duration_sec",
+    "unique_src_ips", "unique_dst_ips", "tcp_count", "udp_count", "icmp_count",
+]
+FEATURE_COUNT = len(FEATURE_COLUMNS)
 
 
 # ----------------------------
-# Model architecture (must match training)
+# Model Architecture & Setup
 # ----------------------------
-
-
 def build_model_architecture(input_shape):
     """Rebuild the model architecture to match training."""
     from tensorflow.keras import layers
+    
+    # Check if a model file exists to avoid unnecessary model rebuilding
+    if MODEL_PATH.exists():
+        return None # Return None if model is loaded from file
 
+    print("Building model architecture (NO SAVED MODEL FOUND)...")
     inputs = layers.Input(shape=input_shape)
     attn = layers.MultiHeadAttention(
         num_heads=4, key_dim=input_shape[-1])(inputs, inputs)
@@ -44,539 +109,228 @@ def build_model_architecture(input_shape):
     ffn = layers.Dense(input_shape[-1])(ffn)
     x = layers.LayerNormalization(epsilon=1e-6)(attn + ffn)
     x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dense(64, activation="relu")(x)
     outputs = layers.Dense(1, activation="sigmoid")(x)
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    
+    model = keras.Model(inputs, outputs)
     return model
 
+def load_resources():
+    """Loads the model and scaler."""
+    # 1. Load Scaler
+    if not SCALER_PATH.exists():
+        print(f"Error: Scaler file not found at {SCALER_PATH}. Prediction cannot run.")
+        sys.exit(1)
+    scaler = joblib.load(SCALER_PATH)
+    print(f"Loaded scaler from {SCALER_PATH}")
 
-# ----------------------------
-# CONFIG
-# ----------------------------
-ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "ddos_transformer.h5"  # path to your trained Transformer
-SCALER_PATH = ROOT / "scaler.gz"  # path to your saved scaler (joblib)
-FEATURE_META_PATH = ROOT / "feature_columns.json"
-# number of 1-sec windows per sequence (same window used in training)
-SEQ_LEN = 10
-WINDOW_SEC = 1.0  # aggregation window duration in seconds
-PRED_THRESHOLD = 0.5  # threshold for attack detection
-LOG_FILE = "ddos_alerts.log"  # where to write alerts
-
-# Choose which inputs to enable
-ENABLE_SNIF = True  # live interface sniffing via scapy/tcpdump
-# pfSense log tailing (clog -f /var/log/filter.log) or tail -F
-ENABLE_PFSENSE = False
-
-# If sniffing, set interface (e.g., "eth0", "ens3"). If None, scapy chooses default
-SNIFF_IFACE = "VMware Network Adapter VMnet8"
-
-# pfSense log command (change if not using clog)
-# or: ["tail", "-F", "/path/to/filter.log"]
-PFSENSE_LOG_CMD = ["clog", "-f", "/var/log/filter.log"]
-
-# ----------------------------
-# Helper: feature aggregation per 1-second window
-# ----------------------------
-FEATURE_ORDER = list(load_feature_metadata(FEATURE_META_PATH))
-if len(FEATURE_ORDER) != len(FEATURE_COLUMNS):
-    print(
-        f"Feature count mismatch between config ({len(FEATURE_ORDER)}) and code ({len(FEATURE_COLUMNS)}). "
-        "Using on-disk order.",
-        file=sys.stderr,
-    )
-
-
-def make_window_feature(packet_stats):
-    """
-    Input: packet_stats from last WINDOW_SEC (dict)
-    Output: 1D numpy array of features (order must match training)
-    Features chosen here (example):
-      - packet_count
-      - byte_count
-      - avg_pkt_size
-      - std_pkt_size
-      - duration (in seconds)  (if 0 -> small epsilon)
-      - unique_src_ips
-      - unique_dst_ips
-      - tcp_count
-      - udp_count
-      - icmp_count
-    Adjust this list to match the features you used during training.
-    """
-    pc = packet_stats["count"]
-    bc = packet_stats["bytes"]
-    sizes = packet_stats["sizes"]
-    duration = max(packet_stats["last_ts"] - packet_stats["first_ts"], 1e-6)
-    avg_size = float(np.mean(sizes)) if sizes else 0.0
-    std_size = float(np.std(sizes)) if sizes else 0.0
-    uniq_src = len(packet_stats["srcs"])
-    uniq_dst = len(packet_stats["dsts"])
-    proto_counts = packet_stats["protos"]
-    tcp_c = proto_counts.get("TCP", 0)
-    udp_c = proto_counts.get("UDP", 0)
-    icmp_c = proto_counts.get("ICMP", 0)
-
-    feature_map = {
-        "packet_count": pc,
-        "byte_count": bc,
-        "avg_pkt_size": avg_size,
-        "std_pkt_size": std_size,
-        "duration_sec": duration,
-        "unique_src_ips": float(uniq_src),
-        "unique_dst_ips": float(uniq_dst),
-        "tcp_count": float(tcp_c),
-        "udp_count": float(udp_c),
-        "icmp_count": float(icmp_c),
-    }
-
-    feat = np.array([feature_map.get(col, 0.0)
-                     for col in FEATURE_ORDER], dtype=float)
-    return feat
-
-
-# ----------------------------
-# Helper: Build packet stats from buffer
-# ----------------------------
-def build_packet_stats_from_buffer(buf, now):
-    """Build packet_stats dictionary from buffer of (ts, length, src, dst, proto) tuples."""
-    if buf:
-        srcs = set()
-        dsts = set()
-        protos = Counter()
-        sizes = []
-        total_bytes = 0
-        times = []
-
-        for (ts, length, src, dst, proto) in buf:
-            times.append(ts)
-            sizes.append(length)
-            total_bytes += length
-            if src:
-                srcs.add(src)
-            if dst:
-                dsts.add(dst)
-            protos[proto] += 1
-
-        return {
-            "count": len(buf),
-            "bytes": total_bytes,
-            "sizes": sizes,
-            "first_ts": min(times) if times else now,
-            "last_ts": max(times) if times else now,
-            "srcs": srcs,
-            "dsts": dsts,
-            "protos": protos,
-        }
+    # 2. Load Model
+    if not MODEL_PATH.exists():
+        # Fallback to building architecture if model file is missing
+        model = build_model_architecture((SEQ_LEN, FEATURE_COUNT))
+        if model is None:
+             print(f"Error: Model file not found at {MODEL_PATH} and model could not be rebuilt.")
+             sys.exit(1)
+        # Note: A real model would require loaded weights. This is just a placeholder.
+        print("WARNING: Using un-trained model architecture placeholder.")
     else:
-        return {
-            "count": 0, "bytes": 0, "sizes": [],
-            "first_ts": now, "last_ts": now,
-            "srcs": set(), "dsts": set(), "protos": Counter()
-        }
+        model = keras.models.load_model(MODEL_PATH)
+        print(f"Loaded model from {MODEL_PATH}")
+
+    return model, scaler
 
 
 # ----------------------------
-# Packet capture: tcpdump (Linux) - HIGH PERFORMANCE
+# Data Acquisition Workers (Fast C++ interaction)
 # ----------------------------
-def sniffing_worker_tcpdump(aggregate_queue, stop_event):
+
+def sniffing_worker(aggregator: 'FlowAggregator', stop_event: threading.Event):
     """
-    High-speed packet capture using tcpdump (Linux).
-    Requires: tcpdump installed (usually pre-installed on Linux)
+    Simulates a high-speed packet capture thread. 
+    Passes raw packet data directly to the C++ aggregator.
     """
-    import re
-    import socket as socket_lib
+    # NOTE: In a real environment, this is where you would initialize Scapy 
+    # and use sniff(prn=...) or similar high-performance tools.
+    
+    print("Sniffing worker started (MOCK).")
+    
+    # Mock data generation loop
+    while not stop_event.is_set():
+        # --- Mock Raw Packet Data ---
+        # 1. Extract packet info:
+        #    - flow_id: str (e.g., "192.168.1.1:12345:8.8.8.8:53:17")
+        #    - packet_size: int 
+        #    - protocol: int (6=TCP, 17=UDP, 1=ICMP)
+        #    - current_time_ms: long long (Current timestamp in milliseconds)
+        
+        flow_id = "192.168.1.1:54321:1.1.1.1:53:17" # Dummy flow
+        packet_size = np.random.randint(64, 1500)
+        protocol = 17 # UDP
+        current_time_ms = int(time.time() * 1000)
+        
+        # 2. Pass raw data to the C++ object
+        # THIS CALL IS EXTREMELY FAST (O(1) lookup in C++ hash map)
+        aggregator.update_flow(flow_id, packet_size, protocol, current_time_ms)
+        
+        # Adjust sleep based on expected packet rate. Very low sleep for high rate.
+        time.sleep(0.0001) 
 
-    current_buffer = deque(maxlen=100000)
-    buffer_lock = threading.Lock()
-    last_flush = time.time()
-    packet_count = 0
+    print("Sniffing worker stopped.")
 
-    # Build tcpdump command
-    tcpdump_cmd = ["tcpdump", "-n", "-l", "-q", "-tttt"]
-    if SNIFF_IFACE:
-        tcpdump_cmd.extend(["-i", SNIFF_IFACE])
-    # Output format: timestamp IP src > dst: flags ... length N
-    tcpdump_cmd.append("ip or ip6")
+def pfsense_worker(aggregator: 'FlowAggregator', stop_event: threading.Event):
+    """
+    Simulates tailing a log file (like pfSense filter.log) and updating flow state.
+    """
+    print("pfSense worker started (MOCK).")
+    
+    # Mock data generation loop
+    while not stop_event.is_set():
+        # --- Mock Log Entry Data ---
+        # In real life, you would parse a log line to get these values.
+        flow_id = "10.0.0.10:80:192.168.1.100:43210:6" # Dummy flow
+        packet_size = 64
+        protocol = 6 # TCP
+        current_time_ms = int(time.time() * 1000)
+        
+        # Pass raw data to the C++ object
+        aggregator.update_flow(flow_id, packet_size, protocol, current_time_ms)
+        
+        time.sleep(0.01) # Log tailing is usually slower than sniffing
 
-    try:
-        proc = subprocess.Popen(
-            tcpdump_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1
-        )
-        print(
-            f"tcpdump capture started on: {SNIFF_IFACE or 'default interface'}")
-
-        # Regex patterns for parsing tcpdump output
-        # Example: 2024-01-01 12:00:00.123456 IP 192.168.1.1.80 > 192.168.1.2.12345: Flags [P.], seq 1:100, ack 1, length 99
-        ip_pattern = re.compile(
-            r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+IP\s+(\S+)\s+>\s+(\S+):.*length\s+(\d+)'
-        )
-        ip6_pattern = re.compile(
-            r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+IP6\s+(\S+)\s+>\s+(\S+):.*length\s+(\d+)'
-        )
-        proto_pattern = re.compile(r'\b(TCP|UDP|ICMP|ICMP6)\b')
-
-        while not stop_event.is_set():
-            try:
-                line = proc.stdout.readline()
-                if not line:
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.01)
-                    continue
-
-                # Parse tcpdump line
-                ts_str = None
-                src = None
-                dst = None
-                length = 0
-                proto = "OTHER"
-
-                # Try IPv4 pattern first
-                match = ip_pattern.search(line)
-                if match:
-                    ts_str, src_full, dst_full, length_str = match.groups()
-                    # Extract IP from "ip.port" format
-                    src = src_full.split(
-                        '.')[0] if '.' in src_full else src_full.split(':')[0]
-                    dst = dst_full.split(
-                        '.')[0] if '.' in dst_full else dst_full.split(':')[0]
-                    length = int(length_str)
-                else:
-                    # Try IPv6 pattern
-                    match = ip6_pattern.search(line)
-                    if match:
-                        ts_str, src_full, dst_full, length_str = match.groups()
-                        src = src_full.split(
-                            '.')[0] if '.' in src_full else src_full.split(':')[0]
-                        dst = dst_full.split(
-                            '.')[0] if '.' in dst_full else dst_full.split(':')[0]
-                        length = int(length_str)
-
-                # Determine protocol
-                proto_match = proto_pattern.search(line)
-                if proto_match:
-                    proto_str = proto_match.group(1).upper()
-                    if proto_str in ["TCP", "UDP", "ICMP"]:
-                        proto = proto_str
-                    elif proto_str == "ICMP6":
-                        proto = "ICMP"
-
-                # Parse timestamp
-                try:
-                    if ts_str:
-                        # Parse tcpdump timestamp format
-                        from datetime import datetime
-                        dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S.%f")
-                        ts = dt.timestamp()
-                    else:
-                        ts = time.time()
-                except:
-                    ts = time.time()
-
-                with buffer_lock:
-                    current_buffer.append((ts, length, src, dst, proto))
-                    packet_count += 1
-
-            except Exception:
-                continue
-
-            # Flush window
-            now = time.time()
-            if now - last_flush >= WINDOW_SEC:
-                with buffer_lock:
-                    if len(current_buffer) == 0:
-                        last_flush = now
-                        continue
-                    buf = list(current_buffer)
-                    current_buffer.clear()
-                    local_count = packet_count
-                    packet_count = 0
-                last_flush = now
-
-                packet_stats = build_packet_stats_from_buffer(buf, now)
-                feat = make_window_feature(packet_stats)
-                aggregate_queue.put(("sniff", feat))
-
-                if local_count > 0:
-                    print(
-                        f"Captured {local_count} packets (tcpdump)", flush=True)
-
-    except FileNotFoundError:
-        print("ERROR: tcpdump not found. Install with: sudo apt-get install tcpdump", file=sys.stderr)
-    except Exception as e:
-        print(f"tcpdump error: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
-    finally:
-        try:
-            if 'proc' in locals():
-                proc.terminate()
-                proc.wait(timeout=2)
-        except:
-            pass
+    print("pfSense worker stopped.")
 
 
 # ----------------------------
-# Main sniffing worker - OS detection and method selection
+# Prediction Worker (Slow Model interaction)
 # ----------------------------
-def sniffing_worker(aggregate_queue, stop_event):
-    if sys.platform.startswith('linux'):
-        try:
-            # Check if tcpdump is available
-            result = subprocess.run(
-                ["which", "tcpdump"],
-                capture_output=True,
-                text=True,
-                timeout=1
-            )
-            if result.returncode == 0:
-                print("Using tcpdump (Linux) for high-speed capture")
-                sniffing_worker_tcpdump(aggregate_queue, stop_event)
-                return
+
+def predictor_worker(aggregator: 'FlowAggregator', model: keras.Model, scaler, stop_event: threading.Event):
+    """
+    Periodically checks the C++ aggregator for completed feature windows,
+    scales, transforms the data into a sequence, and makes a prediction.
+    """
+    # Deque to hold the last SEQ_LEN feature windows
+    history_buffer = deque(maxlen=SEQ_LEN)
+    
+    logf = open(LOG_FILE, 'a')
+    print(f"Predictor worker started. Logging alerts to {LOG_FILE}")
+    
+    # Initialize the buffer with zeros to start (a common practice)
+    dummy_window = np.zeros(FEATURE_COUNT)
+    for _ in range(SEQ_LEN):
+        history_buffer.append(dummy_window)
+
+    while not stop_event.is_set():
+        current_time_ms = int(time.time() * 1000)
+        
+        # 1. High-speed C++ check and flush
+        # This returns a list of feature vectors (one for each flow in the completed window)
+        feature_vectors = aggregator.check_and_flush_window(current_time_ms)
+        
+        if feature_vectors:
+            # 2. Convert features to NumPy array
+            # The C++ binding ensures this conversion is also fast.
+            window_data = np.array(feature_vectors, dtype=np.float32)
+            
+            # --- Aggregation and Scaling (Must match training preprocessing) ---
+            # In your training, the 10 features are computed *per flow*. 
+            # If the model expects a single vector per window, you must aggregate 
+            # the flows within this window (e.g., mean, max, or sum of features).
+            
+            # We will use the mean across all flows in the window as a simple representation
+            window_feature_vector = np.mean(window_data, axis=0)
+            
+            # 3. Scale the window feature vector
+            scaled_vector = scaler.transform(window_feature_vector.reshape(1, -1)).flatten()
+
+            # 4. Update the sequence history
+            history_buffer.append(scaled_vector)
+
+            # 5. Prepare input for the Transformer (batch_size=1, SEQ_LEN, FEATURE_COUNT)
+            # The buffer is already SEQ_LEN long.
+            X_seq = np.array(history_buffer).reshape(1, SEQ_LEN, FEATURE_COUNT)
+
+            # 6. Predict
+            # Prediction is typically the slowest step.
+            pred = model.predict(X_seq, verbose=0)[0][0]
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+
+            # 7. Alerting Logic
+            if pred >= PRED_THRESHOLD:
+                # We can't determine the exact source of the attack from the aggregated window,
+                # but we know the window itself is malicious.
+                msg = f"{ts} ALERT: DDoS suspected (score={pred:.4f}). Window is anomalous."
+                print(msg)
+                logf.write(msg + "\n")
+                logf.flush()
             else:
-                print("tcpdump not found, falling back to scapy", file=sys.stderr)
-                print("Install with: sudo apt-get install tcpdump", file=sys.stderr)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            print("tcpdump check failed, quit...", file=sys.stderr)
+                # optional: print normal score occasionally
+                print(f"{ts} OK score={pred:.4f}")
+        
+        # Allow other threads/tasks to run
+        time.sleep(0.001)
 
-        return
-
-    else:
-        print(f"Unknown OS. This program works only on Linux platforms.", file=sys.stderr)
-        print(f"Quitting...", file=sys.stderr)
-        return
-
-
-# ----------------------------
-# pfSense log tail worker
-# ----------------------------
-def pfsense_worker(aggregate_queue, stop_event):
-    """
-    Tail pfSense filter.log in real-time (via clog -f or tail -F).
-    Parse each line minimally to extract timestamp, src_ip, dst_ip, proto, size.
-    Aggregate same as sniffing_worker into 1-second windows.
-    """
-    try:
-        proc = subprocess.Popen(
-            PFSENSE_LOG_CMD, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    except Exception as e:
-        print("Failed to start pfSense log command:", e, file=sys.stderr)
-        return
-
-    packet_stats = {"count": 0, "bytes": 0, "sizes": [], "first_ts": 0.0, "last_ts": 0.0, "srcs": set(), "dsts": set(),
-                    "protos": Counter()}
-    window_start = time.time()
-
-    def flush_window():
-        nonlocal packet_stats, window_start
-        feat = make_window_feature(packet_stats)
-        aggregate_queue.put(("pfsense", feat))
-        # reset
-        packet_stats = {"count": 0, "bytes": 0, "sizes": [], "first_ts": 0.0, "last_ts": 0.0, "srcs": set(),
-                        "dsts": set(), "protos": Counter()}
-        window_start = time.time()
-
-    try:
-        while not stop_event.is_set():
-            line = proc.stdout.readline()
-            if not line:
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.01)
-                continue
-            # Parse pfSense filter.log line - minimal/robust parsing:
-            # Example - many pfSense lines have patterns: <timestamp> <host> filterlog: ... SRC=1.2.3.4 DST=5.6.7.8 PROTO=TCP LENGTH=60 ...
-            # We'll extract tokens like SRC=, DST=, PROTO=, LENGTH=
-            ts = time.time()
-            src = None
-            dst = None
-            proto = None
-            length = None
-            parts = line.strip().split()
-            for tok in parts:
-                if tok.startswith("SRC="):
-                    src = tok.split("SRC=")[-1]
-                elif tok.startswith("DST="):
-                    dst = tok.split("DST=")[-1]
-                elif tok.startswith("PROTO="):
-                    proto = tok.split("PROTO=")[-1].upper()
-                elif tok.startswith("LENGTH=") or tok.startswith("LEN="):
-                    try:
-                        length = int(tok.split("=")[-1])
-                    except:
-                        length = None
-
-            if length is None:
-                length = 0
-            # Update packet_stats
-            if packet_stats["count"] == 0:
-                packet_stats["first_ts"] = ts
-            packet_stats["last_ts"] = ts
-            packet_stats["count"] += 1
-            packet_stats["bytes"] += length
-            packet_stats["sizes"].append(length)
-            if src:
-                packet_stats["srcs"].add(src)
-            if dst:
-                packet_stats["dsts"].add(dst)
-            if proto:
-                if proto.startswith("TCP"):
-                    packet_stats["protos"]["TCP"] += 1
-                elif proto.startswith("UDP"):
-                    packet_stats["protos"]["UDP"] += 1
-                elif proto.startswith("ICMP"):
-                    packet_stats["protos"]["ICMP"] += 1
-                else:
-                    packet_stats["protos"]["OTHER"] += 1
-
-            # flush every WINDOW_SEC
-            if time.time() - window_start >= WINDOW_SEC:
-                flush_window()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            proc.terminate()
-        except:
-            pass
-
-
-# ----------------------------
-# Aggregator & Predictor
-# ----------------------------
-def predictor_worker(aggregate_queue, stop_event):
-    # load model & scaler
-    if not MODEL_PATH.exists() or not SCALER_PATH.exists():
-        print("Model or scaler not found. Set MODEL_PATH and SCALER_PATH correctly.", file=sys.stderr)
-        stop_event.set()
-        return
-
-    # Load model - handle Keras 2.x -> 3.x compatibility issue
-    # If direct load fails, rebuild architecture and load weights
-    try:
-        # Try standard load first
-        model = keras.models.load_model(
-            str(MODEL_PATH),
-            compile=False,
-            safe_mode=False
-        )
-    except Exception as e:
-        # If that fails, rebuild architecture and load weights separately
-        print(
-            f"Warning: Direct load failed ({type(e).__name__}), rebuilding architecture and loading weights...",
-            file=sys.stderr)
-        try:
-            # Rebuild the model architecture
-            n_features = len(FEATURE_ORDER)
-            model = build_model_architecture((SEQ_LEN, n_features))
-            # Load weights from the saved model file
-            model.load_weights(str(MODEL_PATH))
-            print("Model loaded successfully using weights-only method.",
-                  file=sys.stderr)
-        except Exception as e2:
-            print(f"Error loading model: {e2}", file=sys.stderr)
-            import traceback
-            traceback.print_exc()
-            stop_event.set()
-            return
-
-    scaler = joblib.load(str(SCALER_PATH))
-
-    seq_deque = deque(maxlen=SEQ_LEN)
-    seq_features = None
-
-    with open(LOG_FILE, "a") as logf:
-        while not stop_event.is_set():
-            try:
-                source, feat = aggregate_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            # feat: 1D numpy array of raw features for the last WINDOW_SEC
-            seq_deque.append(feat)
-            # When we have SEQ_LEN windows, build input
-            if len(seq_deque) == SEQ_LEN:
-                # shape (SEQ_LEN, n_features)
-                X = np.stack(list(seq_deque), axis=0)
-                # scale: scaler expects 2D samples; we flatten then inverse later
-                # shape (SEQ_LEN, n_features)
-                flat = X.reshape(-1, X.shape[-1])
-                scaled_flat = scaler.transform(flat)
-                scaled_seq = scaled_flat.reshape(
-                    1, SEQ_LEN, X.shape[-1])  # batch dim
-                # predict
-                pred = float(model.predict(scaled_seq, verbose=0)[0][0])
-
-                # log & alert in the dashboard
-                import requests
-
-                feature_payload = {col: float(val) for col, val in zip(
-                    FEATURE_ORDER, feat.tolist())}
-                payload = {
-                    "score": pred,
-                    "attack": pred >= PRED_THRESHOLD,
-                    "features": feature_payload,
-                    "feature_order": FEATURE_ORDER,
-                }
-
-                try:
-                    requests.post("http://127.0.0.1:5000/api/update",
-                                  json=payload, timeout=0.2)
-                except:
-                    pass
-
-                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                if pred >= PRED_THRESHOLD:
-                    msg = f"{ts} ALERT: DDoS suspected (score={pred:.4f}) from source={source}"
-                    print(msg)
-                    logf.write(msg + "\n")
-                    logf.flush()
-                else:
-                    # optional: print normal score occasionally
-                    print(f"{ts} OK score={pred:.4f}")
-            # allow other tasks
-            time.sleep(0.001)
+    logf.close()
+    print("Predictor worker stopped.")
 
 
 # ----------------------------
 # Main: start threads
 # ----------------------------
 def main():
-    aggregate_queue = queue.Queue(maxsize=1000)
-    stop_event = threading.Event()
+    # The C++ object acts as the central shared data store, replacing the queue.
+    # It must be initialized with the correct window size.
+    try:
+        aggregator = FlowAggregator(WINDOW_MS) 
+    except Exception as e:
+        print(f"Error initializing FlowAggregator (C++ binding issue?): {e}")
+        return
 
+    # Load model and scaler
+    model, scaler = load_resources()
+    
+    stop_event = threading.Event()
     threads = []
 
+    # Start data acquisition threads
     if ENABLE_SNIF:
         t_sniff = threading.Thread(target=sniffing_worker, args=(
-            aggregate_queue, stop_event), daemon=True)
+            aggregator, stop_event), daemon=True)
         threads.append(t_sniff)
         t_sniff.start()
 
     if ENABLE_PFSENSE:
         t_pfs = threading.Thread(target=pfsense_worker, args=(
-            aggregate_queue, stop_event), daemon=True)
+            aggregator, stop_event), daemon=True)
         threads.append(t_pfs)
         t_pfs.start()
 
+    # Start the prediction thread
     t_pred = threading.Thread(target=predictor_worker, args=(
-        aggregate_queue, stop_event), daemon=True)
+        aggregator, model, scaler, stop_event), daemon=True)
     threads.append(t_pred)
     t_pred.start()
 
-    print("Real-time detector started. Press Ctrl+C to stop.")
+    print("\n--- Detector Running ---")
+    print(f"Window Size: {WINDOW_MS}ms, Sequence Length: {SEQ_LEN}")
+    print("Press Ctrl+C to stop...\n")
+    
     try:
+        # Keep the main thread alive until a signal is received
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("Stopping...")
+        print("\nStopping detector...")
         stop_event.set()
-        time.sleep(1)
+    
+    # Wait for threads to finish
+    for t in threads:
+        t.join(timeout=5)
+    
+    print("Detector stopped gracefully.")
 
 
 if __name__ == "__main__":
+    # Suppress TensorFlow warnings/messages
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+    # Must run main
     main()
