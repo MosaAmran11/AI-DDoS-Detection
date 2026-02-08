@@ -24,7 +24,7 @@ import joblib
 import tensorflow as tf
 from tensorflow import keras
 
-from feature_config import FEATURE_COLUMNS, load_feature_metadata
+from feature_config import load_feature_metadata, KDD_COLUMNS, CATEGORICAL_COLUMNS
 
 # ----------------------------
 # Model architecture (must match training)
@@ -64,51 +64,37 @@ LOG_FILE = "ddos_alerts.log"  # where to write alerts
 
 # Choose which inputs to enable
 ENABLE_SNIF = True  # live interface sniffing via scapy/tcpdump
-# pfSense log tailing (clog -f /var/log/filter.log) or tail -F
-ENABLE_PFSENSE = False
 
 # If sniffing, set interface (e.g., "eth0", "ens3"). If None, scapy chooses default
-SNIFF_IFACE = "VMware Network Adapter VMnet8"
-
-# pfSense log command (change if not using clog)
-# or: ["tail", "-F", "/path/to/filter.log"]
-PFSENSE_LOG_CMD = ["clog", "-f", "/var/log/filter.log"]
+SNIFF_IFACE = "Wi-Fi"
 
 # ----------------------------
 # Helper: feature aggregation per 1-second window
 # ----------------------------
-FEATURE_ORDER = list(load_feature_metadata(FEATURE_META_PATH))
-if len(FEATURE_ORDER) != len(FEATURE_COLUMNS):
+FEATURE_ORDER = load_feature_metadata(FEATURE_META_PATH)
+if not FEATURE_ORDER:
     print(
-        f"Feature count mismatch between config ({len(FEATURE_ORDER)}) and code ({len(FEATURE_COLUMNS)}). "
-        "Using on-disk order.",
+        f"Warning: No feature metadata found at {FEATURE_META_PATH}. "
+        "Please train the model first to generate feature_columns.json",
         file=sys.stderr,
     )
+    sys.exit(1)
+
+print(f"Loaded {len(FEATURE_ORDER)} features from training: {FEATURE_ORDER}")
 
 
 def make_window_feature(packet_stats):
     """
     Input: packet_stats from last WINDOW_SEC (dict)
     Output: 1D numpy array of features (order must match training)
-    Features chosen here (example):
-      - packet_count
-      - byte_count
-      - avg_pkt_size
-      - std_pkt_size
-      - duration (in seconds)  (if 0 -> small epsilon)
-      - unique_src_ips
-      - unique_dst_ips
-      - tcp_count
-      - udp_count
-      - icmp_count
-    Adjust this list to match the features you used during training.
+    Maps packet-level statistics to KDD-style features.
     """
     pc = packet_stats["count"]
     bc = packet_stats["bytes"]
+    src_bytes = packet_stats.get("src_bytes", 0)
+    dst_bytes = packet_stats.get("dst_bytes", 0)
     sizes = packet_stats["sizes"]
     duration = max(packet_stats["last_ts"] - packet_stats["first_ts"], 1e-6)
-    avg_size = float(np.mean(sizes)) if sizes else 0.0
-    std_size = float(np.std(sizes)) if sizes else 0.0
     uniq_src = len(packet_stats["srcs"])
     uniq_dst = len(packet_stats["dsts"])
     proto_counts = packet_stats["protos"]
@@ -116,19 +102,77 @@ def make_window_feature(packet_stats):
     udp_c = proto_counts.get("UDP", 0)
     icmp_c = proto_counts.get("ICMP", 0)
 
+    # KDD-style features
+    num_flows = packet_stats.get("num_flows", 0)
+    srv_count = packet_stats.get("srv_count", 0)
+    serror_rate = packet_stats.get("serror_rate", 0.0)
+    same_srv_rate = packet_stats.get("same_srv_rate", 0.0)
+
+    # Protocol encoding (0=tcp, 1=udp, 2=icmp, 3=other)
+    if tcp_c > 0:
+        protocol_type = 0  # tcp
+    elif udp_c > 0:
+        protocol_type = 1  # udp
+    elif icmp_c > 0:
+        protocol_type = 2  # icmp
+    else:
+        protocol_type = 3  # other
+
+    # Service estimation (simplified: use port-based heuristics)
+    # In real KDD, this is categorical. We'll use a numeric approximation.
+    service = 0  # Default to 'other'
+
+    # Flag estimation (simplified)
+    flag = 0  # Default
+
+    # Build comprehensive feature map matching KDD columns
     feature_map = {
-        "packet_count": pc,
-        "byte_count": bc,
-        "avg_pkt_size": avg_size,
-        "std_pkt_size": std_size,
-        "duration_sec": duration,
-        "unique_src_ips": float(uniq_src),
-        "unique_dst_ips": float(uniq_dst),
-        "tcp_count": float(tcp_c),
-        "udp_count": float(udp_c),
-        "icmp_count": float(icmp_c),
+        "duration": duration,
+        "protocol_type": float(protocol_type),
+        "service": float(service),
+        "flag": float(flag),
+        "src_bytes": float(src_bytes),
+        "dst_bytes": float(dst_bytes),
+        # Land attack (src_ip == dst_ip) - not easily detectable from packets alone
+        "land": 0.0,
+        "wrong_fragment": 0.0,
+        "urgent": 0.0,
+        "hot": 0.0,
+        "num_failed_logins": 0.0,
+        "logged_in": 0.0,
+        "num_compromised": 0.0,
+        "root_shell": 0.0,
+        "su_attempted": 0.0,
+        "num_root": 0.0,
+        "num_file_creations": 0.0,
+        "num_shells": 0.0,
+        "num_access_files": 0.0,
+        "num_outbound_cmds": 0.0,
+        "is_host_login": 0.0,
+        "is_guest_login": 0.0,
+        "count": float(num_flows),  # Number of connections to the same host
+        # Number of connections to the same service
+        "srv_count": float(srv_count),
+        "serror_rate": serror_rate,
+        "srv_serror_rate": serror_rate,  # Simplified
+        "rerror_rate": 0.0,
+        "srv_rerror_rate": 0.0,
+        "same_srv_rate": same_srv_rate,
+        "diff_srv_rate": 1.0 - same_srv_rate if same_srv_rate <= 1.0 else 0.0,
+        "srv_diff_host_rate": 0.0,
+        "dst_host_count": float(uniq_dst),
+        "dst_host_srv_count": float(srv_count),
+        "dst_host_same_srv_rate": same_srv_rate,
+        "dst_host_diff_srv_rate": 1.0 - same_srv_rate if same_srv_rate <= 1.0 else 0.0,
+        "dst_host_same_src_port_rate": 0.0,
+        "dst_host_srv_diff_host_rate": 0.0,
+        "dst_host_serror_rate": serror_rate,
+        "dst_host_srv_serror_rate": serror_rate,
+        "dst_host_rerror_rate": 0.0,
+        "dst_host_srv_rerror_rate": 0.0,
     }
 
+    # Extract features in the order they were selected during training
     feat = np.array([feature_map.get(col, 0.0)
                     for col in FEATURE_ORDER], dtype=float)
     return feat
@@ -138,40 +182,129 @@ def make_window_feature(packet_stats):
 # Helper: Build packet stats from buffer
 # ----------------------------
 def build_packet_stats_from_buffer(buf, now):
-    """Build packet_stats dictionary from buffer of (ts, length, src, dst, proto) tuples."""
+    """
+    Build enhanced packet_stats dictionary from buffer of (ts, length, src, dst, proto, src_port, dst_port, flags) tuples.
+    Enhanced to support KDD-style feature extraction.
+    """
     if buf:
         srcs = set()
         dsts = set()
         protos = Counter()
         sizes = []
-        total_bytes = 0
+        src_bytes = 0
+        dst_bytes = 0
         times = []
+        flows = {}  # (src_ip, dst_ip, src_port, dst_port, proto) -> flow stats
+        error_packets = 0
+        tcp_flags = Counter()
 
-        for (ts, length, src, dst, proto) in buf:
+        for packet in buf:
+            if len(packet) >= 5:
+                ts, length, src, dst, proto = packet[0], packet[1], packet[2], packet[3], packet[4]
+                src_port = packet[5] if len(packet) > 5 else 0
+                dst_port = packet[6] if len(packet) > 6 else 0
+                flags = packet[7] if len(packet) > 7 else 0
+            else:
+                continue
+
             times.append(ts)
             sizes.append(length)
-            total_bytes += length
             if src:
                 srcs.add(src)
             if dst:
                 dsts.add(dst)
             protos[proto] += 1
 
+            # Track bytes by direction (simplified: assume first packet direction)
+            if src and dst:
+                # Simple heuristic: if we've seen this flow before, it's likely same direction
+                flow_key = (src, dst, src_port, dst_port, proto)
+                if flow_key not in flows:
+                    flows[flow_key] = {'src_bytes': 0,
+                                       'dst_bytes': 0, 'count': 0, 'errors': 0}
+
+                flows[flow_key]['count'] += 1
+                # Heuristic: assume packets from src to dst are src_bytes
+                if len(flows) % 2 == 0:  # Alternate for simplicity
+                    src_bytes += length
+                    flows[flow_key]['src_bytes'] += length
+                else:
+                    dst_bytes += length
+                    flows[flow_key]['dst_bytes'] += length
+
+                # Track TCP flags if available
+                if flags and proto == "TCP":
+                    tcp_flags[flags] += 1
+            else:
+                src_bytes += length
+
+            # Simple error detection (can be enhanced)
+            if length == 0:
+                error_packets += 1
+
+        total_bytes = src_bytes + dst_bytes
+        num_flows = len(flows)
+
+        # Count unique services (destination IP + destination port combinations)
+        services = set()
+        for packet in buf:
+            if len(packet) >= 7:
+                dst = packet[3]
+                dst_port = packet[6]
+                if dst:
+                    services.add((dst, dst_port))
+        srv_count = len(services)
+
+        # Compute error rates
+        total_packets = len(buf)
+        serror_rate = error_packets / \
+            max(total_packets, 1) if total_packets > 0 else 0.0
+
+        # Connection statistics - same service rate
+        # Count flows with same destination service
+        dst_services = {}
+        for packet in buf:
+            if len(packet) >= 7:
+                src = packet[2]
+                dst = packet[3]
+                dst_port = packet[6]
+                if src and dst:
+                    service_key = (dst, dst_port)
+                    if service_key not in dst_services:
+                        dst_services[service_key] = set()
+                    dst_services[service_key].add(src)
+
+        # Calculate same service rate
+        same_srv_count = sum(
+            1 for src_set in dst_services.values() if len(src_set) > 1)
+        same_srv_rate = same_srv_count / \
+            max(num_flows, 1) if num_flows > 0 else 0.0
+
         return {
             "count": len(buf),
             "bytes": total_bytes,
+            "src_bytes": src_bytes,
+            "dst_bytes": dst_bytes,
             "sizes": sizes,
             "first_ts": min(times) if times else now,
             "last_ts": max(times) if times else now,
             "srcs": srcs,
             "dsts": dsts,
             "protos": protos,
+            "num_flows": num_flows,
+            "srv_count": srv_count,
+            "serror_rate": serror_rate,
+            "same_srv_rate": same_srv_rate,
+            "tcp_flags": tcp_flags,
+            "flows": flows,
         }
     else:
         return {
-            "count": 0, "bytes": 0, "sizes": [],
+            "count": 0, "bytes": 0, "src_bytes": 0, "dst_bytes": 0, "sizes": [],
             "first_ts": now, "last_ts": now,
-            "srcs": set(), "dsts": set(), "protos": Counter()
+            "srcs": set(), "dsts": set(), "protos": Counter(),
+            "num_flows": 0, "srv_count": 0, "serror_rate": 0.0,
+            "same_srv_rate": 0.0, "tcp_flags": Counter(), "flows": {}
         }
 
 
@@ -218,6 +351,9 @@ def sniffing_worker_pypcap(aggregate_queue, stop_event):
                 src = None
                 dst = None
                 proto = "OTHER"
+                src_port = 0
+                dst_port = 0
+                flags = 0
 
                 # Fast parsing with dpkt
                 try:
@@ -229,8 +365,15 @@ def sniffing_worker_pypcap(aggregate_queue, stop_event):
 
                         if isinstance(ip.data, dpkt.tcp.TCP):
                             proto = "TCP"
+                            tcp = ip.data
+                            src_port = tcp.sport
+                            dst_port = tcp.dport
+                            flags = tcp.flags
                         elif isinstance(ip.data, dpkt.udp.UDP):
                             proto = "UDP"
+                            udp = ip.data
+                            src_port = udp.sport
+                            dst_port = udp.dport
                         elif isinstance(ip.data, dpkt.icmp.ICMP):
                             proto = "ICMP"
                     elif isinstance(eth.data, dpkt.ip6.IP6):
@@ -242,15 +385,29 @@ def sniffing_worker_pypcap(aggregate_queue, stop_event):
                         # IPv6 protocol check
                         if ip6.nxt == 6:  # TCP
                             proto = "TCP"
+                            try:
+                                tcp = dpkt.tcp.TCP(ip6.data)
+                                src_port = tcp.sport
+                                dst_port = tcp.dport
+                                flags = tcp.flags
+                            except:
+                                pass
                         elif ip6.nxt == 17:  # UDP
                             proto = "UDP"
+                            try:
+                                udp = dpkt.udp.UDP(ip6.data)
+                                src_port = udp.sport
+                                dst_port = udp.dport
+                            except:
+                                pass
                         elif ip6.nxt == 58:  # ICMPv6
                             proto = "ICMP"
                 except:
                     pass  # Skip non-IP packets
 
                 with buffer_lock:
-                    current_buffer.append((ts, length, src, dst, proto))
+                    current_buffer.append(
+                        (ts, length, src, dst, proto, src_port, dst_port, flags))
                     packet_count += 1
 
             except Exception:
@@ -340,28 +497,71 @@ def sniffing_worker_tcpdump(aggregate_queue, stop_event):
                 ts_str = None
                 src = None
                 dst = None
+                src_port = 0
+                dst_port = 0
                 length = 0
                 proto = "OTHER"
+                flags = 0
 
                 # Try IPv4 pattern first
                 match = ip_pattern.search(line)
                 if match:
                     ts_str, src_full, dst_full, length_str = match.groups()
-                    # Extract IP from "ip.port" format
-                    src = src_full.split(
-                        '.')[0] if '.' in src_full else src_full.split(':')[0]
-                    dst = dst_full.split(
-                        '.')[0] if '.' in dst_full else dst_full.split(':')[0]
+                    # Extract IP and port from "ip.port" format
+                    src_parts = src_full.split('.')
+                    if len(src_parts) >= 5:  # IPv4 with port
+                        src = '.'.join(src_parts[:4])
+                        try:
+                            src_port = int(src_parts[4])
+                        except:
+                            src_port = 0
+                    else:
+                        src = src_full.split(
+                            ':')[0] if ':' in src_full else src_full
+
+                    dst_parts = dst_full.split('.')
+                    if len(dst_parts) >= 2:  # Check if port is present
+                        # Try to extract port (last part after last dot)
+                        try:
+                            dst_port = int(dst_parts[-1].split(':')[0])
+                            dst = '.'.join(
+                                dst_parts[:-1]) if len(dst_parts) > 1 else dst_parts[0]
+                        except:
+                            dst = dst_full.split(
+                                ':')[0] if ':' in dst_full else dst_full
+                    else:
+                        dst = dst_full.split(
+                            ':')[0] if ':' in dst_full else dst_full
                     length = int(length_str)
                 else:
                     # Try IPv6 pattern
                     match = ip6_pattern.search(line)
                     if match:
                         ts_str, src_full, dst_full, length_str = match.groups()
-                        src = src_full.split(
-                            '.')[0] if '.' in src_full else src_full.split(':')[0]
-                        dst = dst_full.split(
-                            '.')[0] if '.' in dst_full else dst_full.split(':')[0]
+                        # IPv6 format: [ipv6]:port or ipv6
+                        if '[' in src_full and ']' in src_full:
+                            src = src_full.split('[')[1].split(']')[0]
+                            port_part = src_full.split(']:')
+                            if len(port_part) > 1:
+                                try:
+                                    src_port = int(port_part[1].split('.')[0])
+                                except:
+                                    src_port = 0
+                        else:
+                            src = src_full.split(
+                                ':')[0] if ':' in src_full else src_full
+
+                        if '[' in dst_full and ']' in dst_full:
+                            dst = dst_full.split('[')[1].split(']')[0]
+                            port_part = dst_full.split(']:')
+                            if len(port_part) > 1:
+                                try:
+                                    dst_port = int(port_part[1].split('.')[0])
+                                except:
+                                    dst_port = 0
+                        else:
+                            dst = dst_full.split(
+                                ':')[0] if ':' in dst_full else dst_full
                         length = int(length_str)
 
                 # Determine protocol
@@ -372,6 +572,15 @@ def sniffing_worker_tcpdump(aggregate_queue, stop_event):
                         proto = proto_str
                     elif proto_str == "ICMP6":
                         proto = "ICMP"
+
+                # Try to extract TCP flags from line
+                if "Flags" in line:
+                    if "[S]" in line or "SYN" in line:
+                        flags = 2  # SYN
+                    elif "[F]" in line or "FIN" in line:
+                        flags = 1  # FIN
+                    elif "[P]" in line or "PUSH" in line:
+                        flags = 8  # PSH
 
                 # Parse timestamp
                 try:
@@ -386,7 +595,8 @@ def sniffing_worker_tcpdump(aggregate_queue, stop_event):
                     ts = time.time()
 
                 with buffer_lock:
-                    current_buffer.append((ts, length, src, dst, proto))
+                    current_buffer.append(
+                        (ts, length, src, dst, proto, src_port, dst_port, flags))
                     packet_count += 1
 
             except Exception:
@@ -463,6 +673,9 @@ def sniffing_worker_scapy(aggregate_queue, stop_event):
             src = None
             dst = None
             proto = "OTHER"
+            src_port = 0
+            dst_port = 0
+            flags = 0
 
             # Fast path: check IP layer directly
             ip_layer = pkt.getlayer(IP)
@@ -472,8 +685,20 @@ def sniffing_worker_scapy(aggregate_queue, stop_event):
                 # Check transport layer
                 if pkt.haslayer(TCP):
                     proto = "TCP"
+                    tcp_layer = pkt.getlayer(TCP)
+                    src_port = tcp_layer.sport if hasattr(
+                        tcp_layer, 'sport') else 0
+                    dst_port = tcp_layer.dport if hasattr(
+                        tcp_layer, 'dport') else 0
+                    flags = tcp_layer.flags if hasattr(
+                        tcp_layer, 'flags') else 0
                 elif pkt.haslayer(UDP):
                     proto = "UDP"
+                    udp_layer = pkt.getlayer(UDP)
+                    src_port = udp_layer.sport if hasattr(
+                        udp_layer, 'sport') else 0
+                    dst_port = udp_layer.dport if hasattr(
+                        udp_layer, 'dport') else 0
                 elif pkt.haslayer(ICMP):
                     proto = "ICMP"
             else:
@@ -484,15 +709,28 @@ def sniffing_worker_scapy(aggregate_queue, stop_event):
                     dst = ipv6_layer.dst
                     if pkt.haslayer(TCP):
                         proto = "TCP"
+                        tcp_layer = pkt.getlayer(TCP)
+                        src_port = tcp_layer.sport if hasattr(
+                            tcp_layer, 'sport') else 0
+                        dst_port = tcp_layer.dport if hasattr(
+                            tcp_layer, 'dport') else 0
+                        flags = tcp_layer.flags if hasattr(
+                            tcp_layer, 'flags') else 0
                     elif pkt.haslayer(UDP):
                         proto = "UDP"
+                        udp_layer = pkt.getlayer(UDP)
+                        src_port = udp_layer.sport if hasattr(
+                            udp_layer, 'sport') else 0
+                        dst_port = udp_layer.dport if hasattr(
+                            udp_layer, 'dport') else 0
                     elif pkt.haslayer(ICMP):
                         proto = "ICMP"
 
             # Append without lock if possible (deque is thread-safe for append)
             # But we'll use lock for safety with high-speed capture
             with buffer_lock:
-                current_buffer.append((ts, length, src, dst, proto))
+                current_buffer.append(
+                    (ts, length, src, dst, proto, src_port, dst_port, flags))
                 packet_count += 1
         except:
             # Silently skip malformed packets - no exception handling overhead
@@ -605,100 +843,6 @@ def sniffing_worker(aggregate_queue, stop_event):
 
 
 # ----------------------------
-# pfSense log tail worker
-# ----------------------------
-def pfsense_worker(aggregate_queue, stop_event):
-    """
-    Tail pfSense filter.log in real-time (via clog -f or tail -F).
-    Parse each line minimally to extract timestamp, src_ip, dst_ip, proto, size.
-    Aggregate same as sniffing_worker into 1-second windows.
-    """
-    try:
-        proc = subprocess.Popen(
-            PFSENSE_LOG_CMD, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    except Exception as e:
-        print("Failed to start pfSense log command:", e, file=sys.stderr)
-        return
-
-    packet_stats = {"count": 0, "bytes": 0, "sizes": [], "first_ts": 0.0, "last_ts": 0.0, "srcs": set(), "dsts": set(),
-                    "protos": Counter()}
-    window_start = time.time()
-
-    def flush_window():
-        nonlocal packet_stats, window_start
-        feat = make_window_feature(packet_stats)
-        aggregate_queue.put(("pfsense", feat))
-        # reset
-        packet_stats = {"count": 0, "bytes": 0, "sizes": [], "first_ts": 0.0, "last_ts": 0.0, "srcs": set(),
-                        "dsts": set(), "protos": Counter()}
-        window_start = time.time()
-
-    try:
-        while not stop_event.is_set():
-            line = proc.stdout.readline()
-            if not line:
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.01)
-                continue
-            # Parse pfSense filter.log line - minimal/robust parsing:
-            # Example - many pfSense lines have patterns: <timestamp> <host> filterlog: ... SRC=1.2.3.4 DST=5.6.7.8 PROTO=TCP LENGTH=60 ...
-            # We'll extract tokens like SRC=, DST=, PROTO=, LENGTH=
-            ts = time.time()
-            src = None
-            dst = None
-            proto = None
-            length = None
-            parts = line.strip().split()
-            for tok in parts:
-                if tok.startswith("SRC="):
-                    src = tok.split("SRC=")[-1]
-                elif tok.startswith("DST="):
-                    dst = tok.split("DST=")[-1]
-                elif tok.startswith("PROTO="):
-                    proto = tok.split("PROTO=")[-1].upper()
-                elif tok.startswith("LENGTH=") or tok.startswith("LEN="):
-                    try:
-                        length = int(tok.split("=")[-1])
-                    except:
-                        length = None
-
-            if length is None:
-                length = 0
-            # Update packet_stats
-            if packet_stats["count"] == 0:
-                packet_stats["first_ts"] = ts
-            packet_stats["last_ts"] = ts
-            packet_stats["count"] += 1
-            packet_stats["bytes"] += length
-            packet_stats["sizes"].append(length)
-            if src:
-                packet_stats["srcs"].add(src)
-            if dst:
-                packet_stats["dsts"].add(dst)
-            if proto:
-                if proto.startswith("TCP"):
-                    packet_stats["protos"]["TCP"] += 1
-                elif proto.startswith("UDP"):
-                    packet_stats["protos"]["UDP"] += 1
-                elif proto.startswith("ICMP"):
-                    packet_stats["protos"]["ICMP"] += 1
-                else:
-                    packet_stats["protos"]["OTHER"] += 1
-
-            # flush every WINDOW_SEC
-            if time.time() - window_start >= WINDOW_SEC:
-                flush_window()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            proc.terminate()
-        except:
-            pass
-
-
-# ----------------------------
 # Aggregator & Predictor
 # ----------------------------
 def predictor_worker(aggregate_queue, stop_event):
@@ -807,12 +951,6 @@ def main():
             aggregate_queue, stop_event), daemon=True)
         threads.append(t_sniff)
         t_sniff.start()
-
-    if ENABLE_PFSENSE:
-        t_pfs = threading.Thread(target=pfsense_worker, args=(
-            aggregate_queue, stop_event), daemon=True)
-        threads.append(t_pfs)
-        t_pfs.start()
 
     t_pred = threading.Thread(target=predictor_worker, args=(
         aggregate_queue, stop_event), daemon=True)
