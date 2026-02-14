@@ -75,8 +75,8 @@ else:
 
 
 # --- Global Settings ---
-MODEL_PATH = Path('./ddos_transformer.h5')
-SCALER_PATH = Path('./scaler.gz')
+MODEL_PATH = Path('./model/ddos_transformer.h5')
+SCALER_PATH = Path('./model/scaler.gz')
 LOG_FILE = 'ddos_alerts.log'
 WINDOW_MS = 1000  # 1 second aggregation window
 SEQ_LEN = 10  # Number of historical windows to feed to the Transformer

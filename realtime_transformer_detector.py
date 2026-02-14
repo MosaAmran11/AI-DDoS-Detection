@@ -53,9 +53,9 @@ def build_model_architecture(input_shape):
 # CONFIG
 # ----------------------------
 ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "ddos_transformer.h5"  # path to your trained Transformer
-SCALER_PATH = ROOT / "scaler.gz"  # path to your saved scaler (joblib)
-FEATURE_META_PATH = ROOT / "feature_columns.json"
+MODEL_PATH = ROOT / "model" / "ddos_transformer.h5"  # path to your trained Transformer
+SCALER_PATH = ROOT / "model" / "scaler.gz"  # path to your saved scaler (joblib)
+FEATURE_META_PATH = ROOT / "model" / "feature_columns.json"
 # number of 1-sec windows per sequence (same window used in training)
 SEQ_LEN = 10
 WINDOW_SEC = 1.0  # aggregation window duration in seconds
