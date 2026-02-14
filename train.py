@@ -132,9 +132,9 @@ def main():
 
     dataset_dir, artifact_dir = resolve_paths()
 
-    model_path = artifact_dir / "ddos_transformer.h5"
-    scaler_path = artifact_dir / "scaler.gz"
-    feature_meta_path = artifact_dir / "feature_columns.json"
+    model_path = artifact_dir / "model" / "ddos_transformer.h5"
+    scaler_path = artifact_dir / "model" / "scaler.gz"
+    feature_meta_path = artifact_dir / "model" / "feature_columns.json"
 
     features, labels = load_dataset(dataset_dir)
 
