@@ -9,8 +9,8 @@ cpp_module = Extension(
 
     # List of all C++ source files needed
     sources=[
-        'FlowAggregator.cpp',
-        'FlowAggregator_bindings.cpp'
+        './cpp/FlowAggregator.cpp',
+        './cpp/FlowAggregator_bindings.cpp'
     ],
 
     # Tell the compiler where to find the pybind11 header files

@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-Colab-friendly training entry-point for the DDoS Transformer model.
-
-Usage on Google Colab:
-1. Upload your CSV files (same schema as ``dataset/sample.csv``) into a
-   folder inside Google Drive, e.g. ``MyDrive/ddos_dataset``.
-2. (Optional) Set environment variables before running the script:
-      ``os.environ["DATASET_DIR"] = "/content/drive/MyDrive/ddos_dataset"``
-      ``os.environ["ARTIFACT_DIR"] = "/content/drive/MyDrive/ddos_artifacts"``
-3. Run this file. It mounts Drive automatically when executed inside Colab,
-   cleans the dataset, and saves the model/scaler/metadata back to Drive.
-"""
-
 from __future__ import annotations
 
 import os
@@ -32,33 +19,10 @@ from feature_config import (
     save_feature_metadata,
 )
 
-try:  # Colab detection
-    from google.colab import drive  # type: ignore
-
-    IN_COLAB = True
-except Exception:
-    IN_COLAB = False
-
-ROOT = Path(__file__).resolve().parent
-DEFAULT_COLAB_DATASET = Path("/content/drive/MyDrive/ddos_dataset")
-DEFAULT_COLAB_ARTIFACTS = Path("/content/drive/MyDrive/ddos_artifacts")
-WINDOW = 10
-
-
-def mount_drive_if_needed() -> None:
-    if IN_COLAB:
-        drive.mount("/content/drive", force_remount=False)
-
 
 def resolve_paths() -> Tuple[Path, Path]:
-    if IN_COLAB:
-        dataset_dir = Path(os.environ.get(
-            "DATASET_DIR", DEFAULT_COLAB_DATASET))
-        artifact_dir = Path(os.environ.get(
-            "ARTIFACT_DIR", DEFAULT_COLAB_ARTIFACTS))
-    else:
-        dataset_dir = Path(os.environ.get("DATASET_DIR", ROOT / "dataset"))
-        artifact_dir = Path(os.environ.get("ARTIFACT_DIR", ROOT))
+    dataset_dir = Path(os.environ.get("DATASET_DIR", ROOT / "dataset"))
+    artifact_dir = Path(os.environ.get("ARTIFACT_DIR", ROOT))
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
     if not dataset_dir.exists():
@@ -77,7 +41,7 @@ def load_dataset(dataset_dir: Path) -> Tuple[pd.DataFrame, np.ndarray]:
     frames = []
     for csv_path in csv_files:
         print(f"Loading {csv_path} ...")
-        frames.append(pd.read_csv(csv_path, low_memory=False))
+        frames.append(pd.read_csv(csv_path))
 
     raw_df = pd.concat(frames, ignore_index=True)
     features, labels = build_feature_dataframe(raw_df)
@@ -89,15 +53,14 @@ def to_sequences(data: np.ndarray, labels: np.ndarray, window: int) -> Tuple[np.
     seq_data = []
     seq_labels = []
     for i in range(len(data) - window):
-        seq_data.append(data[i: i + window])
+        seq_data.append(data[i : i + window])
         seq_labels.append(labels[i + window])
     return np.array(seq_data), np.array(seq_labels)
 
 
 def build_model(input_shape: Tuple[int, int]) -> tf.keras.Model:
     inputs = layers.Input(shape=input_shape)
-    attn = layers.MultiHeadAttention(
-        num_heads=4, key_dim=input_shape[-1])(inputs, inputs)
+    attn = layers.MultiHeadAttention(num_heads=4, key_dim=input_shape[-1])(inputs, inputs)
     attn = layers.LayerNormalization(epsilon=1e-6)(inputs + attn)
     ffn = layers.Dense(64, activation="relu")(attn)
     ffn = layers.Dense(input_shape[-1])(ffn)
@@ -106,30 +69,12 @@ def build_model(input_shape: Tuple[int, int]) -> tf.keras.Model:
     x = layers.Dense(64, activation="relu")(x)
     outputs = layers.Dense(1, activation="sigmoid")(x)
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    model.compile(optimizer="adam", loss="binary_crossentropy",
-                  metrics=["accuracy"])
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
 
 def main():
     mount_drive_if_needed()
-
-    # --- GPU CONFIGURATION START ---
-    # Detect and configure GPU to prevent memory allocation errors
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(
-                f"\n✅ GPU Detected: {len(gpus)} device(s). Training will proceed on GPU.")
-            print(f"   Device details: {gpus}\n")
-        except RuntimeError as e:
-            print(f"\n⚠️ GPU configuration error: {e}\n")
-    else:
-        print("\n⚠️ No GPU detected. Training will fall back to CPU.\n")
-    # --- GPU CONFIGURATION END ---
-
     dataset_dir, artifact_dir = resolve_paths()
 
     model_path = artifact_dir / "model" / "ddos_transformer.h5"
@@ -146,7 +91,6 @@ def main():
         X_seq, y_seq, test_size=0.2, random_state=42, stratify=y_seq
     )
 
-    # Automatically uses GPU if configured above
     model = build_model((WINDOW, len(FEATURE_COLUMNS)))
     model.summary()
 
@@ -161,8 +105,7 @@ def main():
     model.save(model_path)
     joblib.dump(scaler, scaler_path)
     save_feature_metadata(feature_meta_path)
-    print(
-        f"Artifacts saved to:\n  {model_path}\n  {scaler_path}\n  {feature_meta_path}")
+    print(f"Artifacts saved to:\n  {model_path}\n  {scaler_path}\n  {feature_meta_path}")
 
 
 if __name__ == "__main__":
